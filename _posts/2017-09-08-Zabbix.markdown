@@ -1,0 +1,128 @@
+---
+layout:     post
+title:      "Zabbix服务网页报错汇总"
+subtitle:   ""
+date:       2017-09-08 15:00:00
+author:     "Lee"
+header-img: ""
+tags:
+    - Nginx
+---
+
+> zabbix是一个基于web界面，提供分布式系统监视以及网络监视功能的企业级的开源解决方案。它可以监视各种网络参数，保证服务器自动的安全运营，并提供灵活的通知机制以让系统管理员快速定位/解决存在的各种问题  
+
+**1.1 zabbix简介**
+
+zabbix是一个基于web界面，提供分布式系统监视以及网络监视功能的企业级的开源解决方案。它可以监视各种网络参数，保证服务器自动的安全运营，并提供灵活的通知机制以让系统管理员快速定位/解决存在的各种问题
+
+**1.1 zabbix组成**
+
+zabbix server和zabbix agent，可选组件zabbix proxy
+
+可以通过SNMP、zabbix agent、fping、端口监视等方法对远程服务器或网络状态完成监视/数据收集等功能。支持linux及类unix、windows平台只能安装客户端(被监控)
+
+**Zabbix 3.0.13服务端安装**
+
+zabbix server3.0无法centos6上进行yum安装，故我们要在centos7上进行yum安装。如果一定要在centos6上进行安装，则强烈建议通过源码方式进行编译安装，同时还需要注意PHP的版本
+
+注意：尽管zabbix server3.0在centos6上不能进行yum安装，但zabbix agent3.0在centos6上是可进行yum安装的
+
+**Web页面报错总结**
+
+3.1 问题一Zabbix alerter processes more than 75% busy
+问题原因：
+
+zabbix服务器邮件进程繁忙导致的，一般是因为设置动作的间隔太短。特殊情况下会产生大量告警，如服务器发几万封邮件过程中，邮件进程发挂了
+
+解决方案：
+
+01.删除数据库解决(风险较大，不建议)
+
+02.修改邮件脚本，将邮件的动作改为打印时间，等待邮件完全释放再改回来，如下
+
+```
+[root@m01 ~]# cat /usr/lib/zabbix/alertscripts/sms 2 3 #!/bin/bash 4 5 echo `date` >>/tmp/sms.txt
+```
+
+3.2 问题二Zabbix discoverer processes more than 75% busy
+问题原因：
+
+01.配置了discovery自动发现任务，配置的每个discovery任务在一定时间内占用1个进程，而zabbix_server.conf中默认配置只有1个discovery(被注释，默认生效)
+
+02.为了快速验证自动发现效果，将discovery任务的"Delay"由默认3600s设置成60s
+
+解决方案：
+
+01.修改配置文件中的StartDiscoverers进程数量，取消其之前的#号并将数值修改为5，最后重启服务
+
+(注：根据系统硬件配置，可以设置成更高的数值，但其范围为0~250)
+```
+[root@m01 ~]# grep 'StartDiscoverers' /etc/zabbix/zabbix_server.conf
+
+### Option: StartDiscoverers
+StartDiscoverers=5
+
+[root@m01 ~]# systemctl restart zabbix-server.service
+```
+02.编写定时任务脚本重启zabbix_server来降低负载
+```
+[root@m01 ~]# crontab -e
+
+@daily service zabbix-server restart > /dev/null 2>&1
+
+```
+5 #计划会每天自动重启Zabbix服务以结束僵尸进程并清理内存等
+3.3 问题三Zabbix poller processes more than 75% busy
+问题原因：
+
+01.通过Zabbix agent采集数据的设备死机或其他原因导致zabbix agent死掉server获取不到数据
+
+02. server向agent获取数据时时间过长，超过了server设置的timeout时间
+
+解决方案：
+
+01.增加Zabbix Server启动时初始化的进程数量
+
+ ### Option: StartPollers 2 3 StartPollers=10 #改成多少取决于服务器的性能和监控的数量，如果内存足够的话可以设置更高
+
+02.修改模板自动发现规则中的保留失去的资源期间为0
+
+3.4 问题四Zabbix housekeeper processes more than 75% busy
+问题原因：
+
+为了防止数据库持续增大，zabbix有自动删除历史数据的机制即housekeeper，而mysql删除数据时性能会降低，就会报错
+
+解决方案：
+
+调整HousekeepingFrequency参数
+
+1 HousekeepingFrequency=12 #间隔时间 2 3 MaxHousekeeperDelete=1000000 #最大删除量
+
+3.5 问题五Zabbix server内存溢出，无法启动
+问题原因：
+
+zabbix使用一段时间后，再次加入一批交换机监控，zabbix-server将无法启动，查看日志显示如下(提示内存溢出，需调整zabbix服务器配置zabbix_server.conf)
+```
+2816:20170725:174352.675 [file:dbconfig.c,line:652] zbx_mem_realloc(): out of memory (requested 162664 bytes)
+
+2816:20170725:174352.675 [file:dbconfig.c,line:652] zbx_mem_realloc(): please increase CacheSize configuration parameter
+```
+解决方案：
+
+```
+1 vim zabbix_server.conf 2 3 CacheSize=1024M #默认为8M
+
+3.6 PHP Fatal error: Allowed memory size of 134217728 bytes exhausted (tried to allocate 11 bytes)
+```
+问题原因：
+
+zabbix某些页面无法打开，查看php日志发现，当访问这个页面时报错内存不足
+
+解决方案：
+
+不清楚是否内存泄露，最简单的方法是调大php进程的可用内存
+```
+
+1 [root@zabbix-master ~]# grep 'memory_limit' /etc/httpd/conf.d/zabbix.conf 2 3 php_value memory_limit 512M #默认128M
+
+```

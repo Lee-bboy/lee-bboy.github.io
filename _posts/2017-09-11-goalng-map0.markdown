@@ -1,0 +1,192 @@
+---
+layout:     post
+title:      "golang并发编程-map并发读写的线程安全性问题"
+subtitle:   ""
+date:       2017-09-11 20:00:00
+author:     "Lee"
+header-img: ""
+tags:
+    - golang
+---
+
+> map的线程安全性问题
+```
+/**
+ * 并发编程，map的线程安全性问题，使用互斥锁的方式
+ */
+package main
+
+import (
+   "sync"
+   "time"
+   "fmt"
+)
+
+var data map[int]int = make(map[int]int)
+var wgMap sync.WaitGroup = sync.WaitGroup{}
+var muMap sync.Mutex = sync.Mutex{}
+
+func main() {
+   // 并发启动的协程数量
+   max := 10000
+   wgMap.Add(max)
+   time1 := time.Now().UnixNano()
+   for i := 0; i < max; i++ {
+      go modifySafe(i)
+   }
+   wgMap.Wait()
+   time2 := time.Now().UnixNano()
+   fmt.Printf("data len=%d, time=%d", len(data), (time2-time1)/1000000)
+}
+
+// 线程安全的方法，增加了互斥锁
+func modifySafe(i int) {
+   //muMap.Lock()
+   data[i] = i
+   //muMap.Unlock()
+   wgMap.Done()
+}
+```
+
+上面的代码中 var data map[int]int 是一个key和value都是int类型的map，启动的协程并发执行时，也只是非常简单的对 data[i]=i 这样的一个赋值操作。
+
+主程序发起1w个并发，不断对map中不同的key进行赋值操作。
+
+在不安全的情况下，我们直接就看到一个panic异常信息，程序是无法正常执行完成的，如下：
+
+```
+fatal error: concurrent map writes
+
+
+
+goroutine 30 [running]:
+
+runtime.throw(0x4d6e44, 0x15)
+
+C:/Go/src/runtime/panic.go:605 +0x9c fp=0xc04209bf48 sp=0xc04209bf28 pc=0x42a22c
+
+runtime.mapassign_fast64(0x4ba4c0, 0xc04207e060, 0xc, 0x0)
+
+C:/Go/src/runtime/hashmap_fast.go:607 +0x3d9 fp=0xc04209bfa8 sp=0xc04209bf48 pc=0x40bed9
+
+main.modifyNotSafe(0xc)
+
+mainMap.go:44 +0x4a fp=0xc04209bfd8 sp=0xc04209bfa8 pc=0x4a1f1a
+
+runtime.goexit()
+
+C:/Go/src/runtime/asm_amd64.s:2337 +0x1 fp=0xc04209bfe0 sp=0xc04209bfd8 pc=0x451cc1
+
+created by main.main
+
+mainMap.go:23 +0x184
+```
+
+
+对比之前，slice的数据结构在不安全的并发执行中是不会报错的，只是数据可能会出现丢失。
+
+而这里的map的数据结构，是直接报错，所以在使用中就必须认真对待，否则整个程序是无法继续执行的。
+
+所以也看出来，Go在对待线程安全性问题方面，对slice还是更加宽容的，对map则更加严格，这也是在并发编程时对我们提出了基本的要求。
+
+
+
+将上面的代码稍微做些修改，对 data[i]=i 的前后增加上 muMap.Lock() 和 muMap.Unlock() ，也就保证了多线程并行的情况下，遇到冲突时有互斥锁的保证，避免出现线程安全性问题。
+
+
+
+
+这里，我们再来探讨一个问题，如何保证map的线程安全性？
+
+上面我们是通过 muMap 这个互斥锁来保证的。
+
+而Go语言有一个概念：“不要通过共享内存来进行通信，而应该通过通信来共享内存”，也就是利用channel来保证线程安全性。
+
+那么，这又要怎么来做呢？下面是实例代码：
+
+```
+/**
+ * 并发编程，map的线程安全性问题，使用channel的方式
+ */
+package main
+
+import (
+   "time"
+   "fmt"
+)
+
+var dataCh map[int]int = make(map[int]int)
+var chMap chan int = make(chan int)
+
+func main() {
+   // 并发启动的协程数量
+   max := 10000
+   time1 := time.Now().UnixNano()
+   for i := 0; i < max; i++ {
+      go modifyByChan(i)
+   }
+   // 处理channel的服务
+   chanServ(max)
+   time2 := time.Now().UnixNano()
+   fmt.Printf("data len=%d, time=%d", len(dataCh), (time2-time1)/1000000)
+}
+func modifyByChan(i int) {
+   chMap <- i
+}
+// 专门处理chMap的服务程序
+func chanServ(max int) {
+   for {
+      i := <- chMap
+      dataCh[i] = i
+      if len(dataCh) == max {
+         return
+      }
+   }
+}
+```
+数据填充的方式我们还是用1w个协程来做，只不过使用了chMap这个channel来做队列。
+
+然后在 chanServ 函数中启动一个服务，专门来消费chMap这个队列，然后把数据给map赋值 dataCh[i]=i 。
+
+
+
+从上面简单的对比中，我们还看不出太多的区别，我们还是可以得出下面一些结论：
+
+1 通过channel的方式，其实就是通过队列把并发执行的数据读写改成了串行化，以避免线程安全性问题；
+
+2 多个协程交互的时候，可以通过依赖同一个 channel对象来进行数据的读写和传递，而不需要共享变量；
+
+
+我们再来对比一下程序的执行效率。
+
+使用互斥锁的方式，执行返回数据如下：
+
+```
+data len=10000, time=4
+```
+
+使用channel的方式，执行返回数据如下：
+
+```
+data len=10000, time=35
+```
+
+可以看出，这种很简单的针对map并发读写的场景，通过互斥锁的方式比channel的方式要快很多，毕竟channel的方式增加了channel的读写操作，而且channel的串行化处理，效率上也会低一些。
+
+所以，根据具体的情况，我们可以考虑优先用什么方式来实现。
+
+优先使用互斥锁的场景：
+
+1 复杂且频繁的数据读写操作，如：缓存数据；
+
+2 应用中全局的共享数据，如：全局变量；
+
+优先使用channel的场景：
+
+1 协程之间局部传递共享数据，如：订阅发布模式；
+
+2 统一的数据处理服务，如：库存更新+订单处理；
+
+
+
+至此，通过3个Go实例讲解，知道在并发读写的情况下，如何搞定线程安全性问题，简单的数据结构就是int类型的安全读写，复杂的数据结构分别详细讲解了slice和map。在这次map的讲解中，还对比了互斥锁和channel的方式，对并发编程有更深入的理解。
